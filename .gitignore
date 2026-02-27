@@ -18,3 +18,5 @@ build/
 
 # Data output (recorded sessions)
 data/
+
+.vscode
