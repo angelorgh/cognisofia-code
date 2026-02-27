@@ -1,0 +1,7 @@
+bleak==2.1.1
+dearpygui==2.2
+pyobjc-core==12.1
+pyobjc-framework-Cocoa==12.1
+pyobjc-framework-CoreBluetooth==12.1
+pyobjc-framework-libdispatch==12.1
+typing_extensions==4.15.0
