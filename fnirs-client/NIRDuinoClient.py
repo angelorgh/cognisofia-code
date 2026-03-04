@@ -10,14 +10,22 @@ import csv
 import logging
 import os
 import struct
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
 from bleak import BleakClient, BleakScanner, BLEDevice
 from bleak.backends.characteristic import BleakGATTCharacteristic
 import platform
+
+# Optional TimescaleDB support (pip install psycopg2-binary)
+try:
+    import psycopg2
+    _PSYCOPG2_AVAILABLE = True
+except ImportError:
+    _PSYCOPG2_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(
@@ -45,6 +53,255 @@ CHUNK_SIZES = [480, 480, 480, 480, 344]
 NUM_PHYSICAL_SOURCES = 8
 NUM_PHYSICAL_DETECTORS = 16
 
+# ===== ADC / DAC conversion constants =====
+ADC_MAX  = 8_388_608.0   # 2^23 (24-bit ADC half-range)
+ADC_VREF = 5.0           # Effective reference voltage (2 × 2.5 V)
+LED_VMAX = 5.0           # MCP4728 VDD reference
+
+
+def _adc_to_voltage(raw: int) -> float:
+    """Convert a 24-bit signed ADC count to voltage (0–5 V)."""
+    return raw * ADC_VREF / ADC_MAX
+
+
+def _intensity_to_voltage(intensity: int) -> float:
+    """Convert a firmware intensity byte (0–255) to LED drive voltage (0–5 V)."""
+    return intensity * LED_VMAX / 255.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TimescaleDB writer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_frames_insert_sql() -> str:
+    """Generate the parameterised INSERT SQL for the frames hypertable."""
+    cols = ["ts", "session_id", "time_elapsed"]
+    for s in range(1, NUM_PHYSICAL_SOURCES + 1):
+        cols += [f"led_s{s}_740nm_rp", f"led_s{s}_850nm_rp",
+                 f"led_s{s}_740nm_lp", f"led_s{s}_850nm_lp"]
+    for s in range(1, NUM_PHYSICAL_SOURCES + 1):
+        for d in range(1, NUM_PHYSICAL_DETECTORS + 1):
+            cols += [f"s{s}_d{d}_740nm_rp", f"s{s}_d{d}_850nm_rp",
+                     f"s{s}_d{d}_740nm_lp", f"s{s}_d{d}_850nm_lp"]
+    for d in range(1, NUM_PHYSICAL_DETECTORS + 1):
+        cols.append(f"dark_d{d}")
+    cols.append("stimulus")
+    ph = ", ".join(["%s"] * len(cols))
+    return f"INSERT INTO frames ({', '.join(cols)}) VALUES ({ph})"
+
+
+_FRAMES_INSERT_SQL = _build_frames_insert_sql()
+
+
+class DBWriter:
+    """
+    Writes fNIRS session and frame data to a TimescaleDB (PostgreSQL) database.
+
+    Frames are buffered in memory and committed in batches of BATCH_SIZE rows.
+    The actual psycopg2 flush is always executed in a thread-pool worker so
+    that the asyncio event loop (and therefore the GUI + BLE callbacks) is
+    never blocked by a network round-trip to the database.
+
+    Thread-safety: all psycopg2 operations are serialised through _lock.
+    _pending is only ever appended/swapped from the event-loop thread
+    (CPython GIL makes the reference swap in _take_batch() atomic).
+    """
+
+    BATCH_SIZE = 50  # rows buffered before a flush (~3 s at 15 Hz)
+
+    def __init__(self):
+        self.conn = None
+        self._lock = threading.Lock()   # serialises all psycopg2 access
+        self._pending: list = []
+        self._session_id = None
+        self.rows_written: int = 0
+
+    # ── Connection ────────────────────────────────────────────────────────────
+
+    def connect(self, host: str, port: str, dbname: str,
+                user: str, password: str) -> tuple:
+        """Open a persistent connection for streaming use."""
+        if not _PSYCOPG2_AVAILABLE:
+            return False, "psycopg2 not installed — run: pip install psycopg2-binary"
+        try:
+            with self._lock:
+                if self.conn and not self.conn.closed:
+                    self.conn.close()
+                self.conn = psycopg2.connect(
+                    host=host, port=int(port), dbname=dbname,
+                    user=user, password=password, connect_timeout=5,
+                )
+                self.conn.autocommit = False
+            logging.info("DB connected: %s@%s:%s/%s", user, host, port, dbname)
+            return True, "Connected"
+        except Exception as exc:
+            self.conn = None
+            return False, str(exc)
+
+    def test_connection(self, host: str, port: str, dbname: str,
+                        user: str, password: str) -> tuple:
+        """Test credentials without storing a permanent connection."""
+        if not _PSYCOPG2_AVAILABLE:
+            return False, "psycopg2 not installed — run: pip install psycopg2-binary"
+        try:
+            conn = psycopg2.connect(
+                host=host, port=int(port), dbname=dbname,
+                user=user, password=password, connect_timeout=5,
+            )
+            conn.close()
+            return True, "Connection successful"
+        except Exception as exc:
+            return False, str(exc)
+
+    def disconnect(self):
+        """Close the stored connection."""
+        with self._lock:
+            if self.conn:
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+        logging.info("DB disconnected")
+
+    @property
+    def is_connected(self) -> bool:
+        return self.conn is not None and self.conn.closed == 0
+
+    # ── Session lifecycle ─────────────────────────────────────────────────────
+
+    def start_session(self, subject_name: str, problem: str) -> str:
+        """Insert a row into sessions and return its UUID as a string."""
+        if not self.is_connected:
+            raise RuntimeError("Not connected to database")
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT INTO sessions (subject_name, problem) "
+                "VALUES (%s, %s) RETURNING session_id",
+                (subject_name or "unknown", problem or "unknown"),
+            )
+            self._session_id = cur.fetchone()[0]
+            self.conn.commit()
+            cur.close()
+        self._pending.clear()
+        self.rows_written = 0
+        logging.info("DB session started: %s", self._session_id)
+        return str(self._session_id)
+
+    def stop_session(self):
+        """Flush remaining rows and finalise the session.
+
+        Blocking — must be called from a thread, not the event-loop thread.
+        FNIRSClient._stop_recording() spawns a daemon thread for this.
+        """
+        self._flush_batch(self._take_batch())
+        with self._lock:
+            if self.is_connected and self._session_id:
+                try:
+                    cur = self.conn.cursor()
+                    cur.execute("SELECT stop_session(%s)", (self._session_id,))
+                    self.conn.commit()
+                    cur.close()
+                    logging.info(
+                        "DB session closed: %s  (%d rows)",
+                        self._session_id, self.rows_written,
+                    )
+                except Exception as exc:
+                    logging.error("DB stop_session error: %s", exc)
+        self._session_id = None
+
+    # ── Frame writes ──────────────────────────────────────────────────────────
+
+    def write_frame(self, ts: datetime, time_elapsed: float,
+                    frame_data: List[List[int]], stimulus: int,
+                    led_config: Optional[dict]) -> bool:
+        """Buffer one frame row.
+
+        Returns True when the batch has reached BATCH_SIZE and is ready
+        to be flushed.  The caller is responsible for calling _take_batch()
+        and scheduling _flush_batch() in a thread-pool executor.
+        """
+        if not self.is_connected or self._session_id is None:
+            return False
+        row = self._build_row(
+            ts, self._session_id, time_elapsed, frame_data, stimulus, led_config
+        )
+        self._pending.append(row)
+        return len(self._pending) >= self.BATCH_SIZE
+
+    def _take_batch(self) -> list:
+        """Atomically extract all buffered rows and reset the buffer.
+
+        The tuple-unpack ``batch, self._pending = self._pending, []`` is
+        atomic under CPython's GIL, so it is safe to call from the
+        event-loop thread while new rows are being appended concurrently.
+        """
+        batch, self._pending = self._pending, []
+        return batch
+
+    def _flush_batch(self, batch: list) -> None:
+        """Write *batch* to the DB in a single transaction.
+
+        Blocking — must be called from a thread-pool worker, never from
+        the asyncio event loop, to avoid freezing the GUI.
+        """
+        if not batch:
+            return
+        with self._lock:
+            if not self.is_connected:
+                logging.warning(
+                    "DB flush: not connected — %d rows dropped", len(batch)
+                )
+                return
+            try:
+                cur = self.conn.cursor()
+                cur.executemany(_FRAMES_INSERT_SQL, batch)
+                self.conn.commit()
+                cur.close()
+                self.rows_written += len(batch)
+                logging.debug("DB flush: %d rows committed", len(batch))
+            except Exception as exc:
+                logging.error("DB flush error: %s", exc)
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _build_row(ts: datetime, session_id, time_elapsed: float,
+                   frame_data: List[List[int]], stimulus: int,
+                   led_config: Optional[dict]) -> tuple:
+        cfg = led_config or {}
+        rp7 = cfg.get("rp_740", [0] * NUM_PHYSICAL_SOURCES)
+        rp8 = cfg.get("rp_850", [0] * NUM_PHYSICAL_SOURCES)
+        lp7 = cfg.get("lp_740", [0] * NUM_PHYSICAL_SOURCES)
+        lp8 = cfg.get("lp_850", [0] * NUM_PHYSICAL_SOURCES)
+
+        vals: list = [ts, session_id, time_elapsed]
+
+        # LED drive voltages
+        for s in range(NUM_PHYSICAL_SOURCES):
+            vals += [_intensity_to_voltage(rp7[s]), _intensity_to_voltage(rp8[s]),
+                     _intensity_to_voltage(lp7[s]), _intensity_to_voltage(lp8[s])]
+
+        # Detector readings
+        for src in range(NUM_PHYSICAL_SOURCES):
+            for det in range(NUM_PHYSICAL_DETECTORS):
+                vals += [
+                    _adc_to_voltage(frame_data[src][det]),
+                    _adc_to_voltage(frame_data[src + 8][det]),
+                    _adc_to_voltage(frame_data[src + 16][det]),
+                    _adc_to_voltage(frame_data[src + 24][det]),
+                ]
+
+        # Dark current
+        for det in range(NUM_PHYSICAL_DETECTORS):
+            vals.append(_adc_to_voltage(frame_data[32][det]))
+
+        vals.append(stimulus)
+        return tuple(vals)
+
 
 class CSVWriter:
     """Handles writing fNIRS data to CSV files."""
@@ -60,32 +317,45 @@ class CSVWriter:
         self.rows_written = 0
 
     def _generate_header(self) -> List[str]:
-        """Generate CSV header matching Android app format."""
+        """Generate CSV header with voltage values and LED configuration."""
         header = ["Timestamp", "Time(s)"]
 
-        # For each physical source (1-8) and detector (1-16):
-        # S{s}_D{d}_740nm_RP, S{s}_D{d}_850nm_RP, S{s}_D{d}_740nm_LP, S{s}_D{d}_850nm_LP
+        # LED configuration columns (voltage applied to each source/wavelength/power)
+        for source in range(1, NUM_PHYSICAL_SOURCES + 1):
+            header.append(f"LED_S{source}_740nm_RP(V)")
+            header.append(f"LED_S{source}_850nm_RP(V)")
+            header.append(f"LED_S{source}_740nm_LP(V)")
+            header.append(f"LED_S{source}_850nm_LP(V)")
+
+        # Detector readings in voltage — S{s}_D{d}_{wavelength}_{power}(V)
         for source in range(1, NUM_PHYSICAL_SOURCES + 1):
             for detector in range(1, NUM_PHYSICAL_DETECTORS + 1):
-                header.append(f"S{source}_D{detector}_740nm_RP")
-                header.append(f"S{source}_D{detector}_850nm_RP")
-                header.append(f"S{source}_D{detector}_740nm_LP")
-                header.append(f"S{source}_D{detector}_850nm_LP")
+                header.append(f"S{source}_D{detector}_740nm_RP(V)")
+                header.append(f"S{source}_D{detector}_850nm_RP(V)")
+                header.append(f"S{source}_D{detector}_740nm_LP(V)")
+                header.append(f"S{source}_D{detector}_850nm_LP(V)")
 
-        # Dark current measurements
+        # Dark current measurements (voltage)
         for detector in range(1, NUM_PHYSICAL_DETECTORS + 1):
-            header.append(f"Dark_D{detector}")
+            header.append(f"Dark_D{detector}(V)")
 
         # Stimulus marker
         header.append("Stimulus")
 
         return header
 
-    def start_session(self) -> str:
-        """Start a new recording session and create CSV file."""
-        # Generate filename with timestamp
+    def start_session(self, subject_name: str = "", problem: str = "") -> str:
+        """Start a new recording session and create CSV file.
+
+        Args:
+            subject_name: Name of the subject being measured.
+            problem: Problem name/number the subject is working on.
+        """
+        # Sanitise inputs: strip, replace spaces with underscores, fallback
+        subj = subject_name.strip().replace(" ", "_") or "unknown"
+        prob = problem.strip().replace(" ", "_") or "unknown"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"fnirs_session_{timestamp}.csv"
+        filename = f"session_{subj}_{prob}_{timestamp}.csv"
         filepath = self.output_dir / filename
 
         # Open file and create CSV writer
@@ -102,9 +372,18 @@ class CSVWriter:
         logging.info("Started CSV recording: %s", filepath)
         return str(filepath)
 
-    def write_frame(self, frame_data: List[List[int]], stimulus: int = 0):
+    def write_frame(
+        self,
+        frame_data: List[List[int]],
+        stimulus: int = 0,
+        led_config: Optional[dict] = None,
+    ):
         """
         Write a frame of data to the CSV file.
+
+        Values are converted from raw 24-bit ADC counts to voltage (V).
+        LED configuration voltages are included per row so mid-session
+        changes are captured.
 
         Args:
             frame_data: 33x17 array of int32 ADC values
@@ -114,6 +393,9 @@ class CSVWriter:
                 - Sources 24-31: 850nm Low Power
                 - Source 32: Dark current
             stimulus: Stimulus marker value (0=off, 10=on)
+            led_config: dict with keys 'rp_740', 'rp_850', 'lp_740', 'lp_850',
+                        each a list of 8 intensity bytes (0-255).
+                        If None, zeros are written.
         """
         if not self.csv_writer or not self.session_start_time:
             return
@@ -126,26 +408,39 @@ class CSVWriter:
         # Build row
         row = [timestamp, f"{elapsed:.3f}"]
 
-        # Extract data for each source-detector pair
-        # Data layout in frame_data[source][detector]:
-        # Sources 0-7: 740nm RP, Sources 8-15: 850nm RP
-        # Sources 16-23: 740nm LP, Sources 24-31: 850nm LP
+        # ── LED configuration voltages (8 sources × 4 modes = 32 cols) ────
+        if led_config:
+            rp7 = led_config.get("rp_740", [0] * 8)
+            rp8 = led_config.get("rp_850", [0] * 8)
+            lp7 = led_config.get("lp_740", [0] * 8)
+            lp8 = led_config.get("lp_850", [0] * 8)
+        else:
+            rp7 = rp8 = lp7 = lp8 = [0] * 8
+
+        for s in range(NUM_PHYSICAL_SOURCES):
+            row.append(f"{_intensity_to_voltage(rp7[s]):.4f}")
+            row.append(f"{_intensity_to_voltage(rp8[s]):.4f}")
+            row.append(f"{_intensity_to_voltage(lp7[s]):.4f}")
+            row.append(f"{_intensity_to_voltage(lp8[s]):.4f}")
+
+        # ── Detector readings converted to voltage ────────────────────────
         for source in range(NUM_PHYSICAL_SOURCES):
             for detector in range(NUM_PHYSICAL_DETECTORS):
-                # 740nm Regular Power (sources 0-7)
-                val_740_rp = frame_data[source][detector]
-                # 850nm Regular Power (sources 8-15)
-                val_850_rp = frame_data[source + 8][detector]
-                # 740nm Low Power (sources 16-23)
-                val_740_lp = frame_data[source + 16][detector]
-                # 850nm Low Power (sources 24-31)
-                val_850_lp = frame_data[source + 24][detector]
+                val_740_rp = _adc_to_voltage(frame_data[source][detector])
+                val_850_rp = _adc_to_voltage(frame_data[source + 8][detector])
+                val_740_lp = _adc_to_voltage(frame_data[source + 16][detector])
+                val_850_lp = _adc_to_voltage(frame_data[source + 24][detector])
 
-                row.extend([val_740_rp, val_850_rp, val_740_lp, val_850_lp])
+                row.extend([
+                    f"{val_740_rp:.6f}",
+                    f"{val_850_rp:.6f}",
+                    f"{val_740_lp:.6f}",
+                    f"{val_850_lp:.6f}",
+                ])
 
-        # Dark current (source 32, detectors 0-15)
+        # Dark current in voltage (source 32, detectors 0-15)
         for detector in range(NUM_PHYSICAL_DETECTORS):
-            row.append(frame_data[32][detector])
+            row.append(f"{_adc_to_voltage(frame_data[32][detector]):.6f}")
 
         # Stimulus marker
         row.append(stimulus)
@@ -199,37 +494,56 @@ class FNIRSClient:
         # Callback for battery updates
         self.on_battery_update: Optional[Callable[[int], None]] = None
 
+        # Current LED configuration (intensity bytes 0-255, per source)
+        self.led_config: Optional[dict] = None
+
+        # Output mode: "csv" | "db" | "both"  (set by GUI before start_streaming)
+        self.output_mode: str = "csv"
+        self.db_writer: Optional[DBWriter] = None
+        self._session_start_time: Optional[float] = None
+
+    @staticmethod
+    def _expand(val: Union[int, List[int]], n: int = 8) -> List[int]:
+        """Return a list of *n* ints.  Accepts a single int (broadcast) or a list."""
+        if isinstance(val, int):
+            return [val] * n
+        if len(val) != n:
+            raise ValueError(f"Expected {n} values, got {len(val)}")
+        return list(val)
+
     def _build_config_packet(
         self,
-        rp_740: int = 255,
-        rp_850: int = 255,
-        lp_740: int = 75,
-        lp_850: int = 64,
+        rp_740: Union[int, List[int]] = 255,
+        rp_850: Union[int, List[int]] = 255,
+        lp_740: Union[int, List[int]] = 75,
+        lp_850: Union[int, List[int]] = 64,
     ) -> bytes:
         """
-        Build the configuration packet to start streaming.
+        Build the 33-byte configuration packet for the NIRDuino.
 
-        Args:
-            rp_740: Regular power intensity for 740nm LEDs (0-255)
-            rp_850: Regular power intensity for 850nm LEDs (0-255)
-            lp_740: Low power intensity for 740nm LEDs (0-255)
-            lp_850: Low power intensity for 850nm LEDs (0-255)
+        Each parameter accepts either a single int (applied to all 8 sources)
+        or a list of 8 ints for per-source control.
 
-        Returns:
-            33-byte configuration packet
+        Packet byte layout:
+            Byte  0     : command flag (0x01 = START)
+            Bytes 1-16  : Regular Power — 8 pairs of (740nm, 850nm)
+            Bytes 17-32 : Low Power     — 8 pairs of (740nm, 850nm)
         """
+        rp7 = self._expand(rp_740)
+        rp8 = self._expand(rp_850)
+        lp7 = self._expand(lp_740)
+        lp8 = self._expand(lp_850)
+
         packet = bytearray(33)
         packet[0] = 0x01  # Start flag
 
-        # Regular power values for 8 sources (740nm, 850nm pairs)
         for i in range(8):
-            packet[1 + i * 2] = rp_740
-            packet[2 + i * 2] = rp_850
+            packet[1 + i * 2] = rp7[i]   # 740nm RP
+            packet[2 + i * 2] = rp8[i]   # 850nm RP
 
-        # Low power values for 8 sources (740nm, 850nm pairs)
         for i in range(8):
-            packet[17 + i * 2] = lp_740
-            packet[18 + i * 2] = lp_850
+            packet[17 + i * 2] = lp7[i]  # 740nm LP
+            packet[18 + i * 2] = lp8[i]  # 850nm LP
 
         return bytes(packet)
 
@@ -301,14 +615,45 @@ class FNIRSClient:
                 data[8][0],
             )
 
-        # Write to CSV if recording
+        # Write to active output(s)
         if self.recording:
             stimulus = 10 if self.stimulus_active else 0
-            self.csv_writer.write_frame(data, stimulus)
+            elapsed = (time.time() - self._session_start_time
+                       if self._session_start_time else 0.0)
+            if self.output_mode in ("csv", "both"):
+                self.csv_writer.write_frame(data, stimulus, self.led_config)
+            if self.output_mode in ("db", "both") and self.db_writer:
+                batch_ready = self.db_writer.write_frame(
+                    datetime.now(), elapsed, data, stimulus, self.led_config
+                )
+                if batch_ready:
+                    # Atomically take the full batch and flush it in a
+                    # thread-pool worker so the event loop is never blocked
+                    # by the psycopg2 network round-trip.
+                    batch = self.db_writer._take_batch()
+                    asyncio.get_event_loop().run_in_executor(
+                        None, self.db_writer._flush_batch, batch
+                    )
 
         # Call user callback if set
         if self.on_frame_received:
             self.on_frame_received(self.frame_count, data)
+
+    def _stop_recording(self):
+        """Stop whichever output(s) are active and reset the recording flag."""
+        if self.output_mode in ("csv", "both"):
+            self.csv_writer.stop_session()
+        if self.output_mode in ("db", "both") and self.db_writer:
+            # stop_session() blocks on the final flush + SQL call; run it in
+            # a daemon thread so neither the event loop nor a sync callback
+            # (e.g. _disconnection_handler) is stalled.
+            threading.Thread(
+                target=self.db_writer.stop_session,
+                daemon=True,
+                name="db-stop-session",
+            ).start()
+        self.recording = False
+        self._session_start_time = None
 
     def set_stimulus(self, active: bool):
         """Set the stimulus marker state."""
@@ -335,10 +680,9 @@ class FNIRSClient:
         self.connected = False
         self.streaming = False
 
-        # Stop CSV recording if active
+        # Stop active output(s)
         if self.recording:
-            self.csv_writer.stop_session()
-            self.recording = False
+            self._stop_recording()
 
     async def connect(self, device: BLEDevice) -> bool:
         """Connect to the device at the given address."""
@@ -370,29 +714,37 @@ class FNIRSClient:
     async def start_streaming(
         self,
         record: bool = True,
-        rp_740: int = 255,
-        rp_850: int = 255,
-        lp_740: int = 75,
-        lp_850: int = 64,
+        rp_740: Union[int, List[int]] = 255,
+        rp_850: Union[int, List[int]] = 255,
+        lp_740: Union[int, List[int]] = 75,
+        lp_850: Union[int, List[int]] = 64,
+        subject_name: str = "",
+        problem: str = "",
     ) -> bool:
         """
         Enable notifications and start data streaming.
 
         Args:
             record: Whether to record data to CSV
-            rp_740: Regular power intensity for 740nm LEDs (0-255)
-            rp_850: Regular power intensity for 850nm LEDs (0-255)
-            lp_740: Low power intensity for 740nm LEDs (0-255)
-            lp_850: Low power intensity for 850nm LEDs (0-255)
+            rp_740: Regular power 740nm intensity — int (all sources) or list of 8
+            rp_850: Regular power 850nm intensity — int (all sources) or list of 8
+            lp_740: Low power 740nm intensity — int (all sources) or list of 8
+            lp_850: Low power 850nm intensity — int (all sources) or list of 8
+            subject_name: Name of the subject being measured
+            problem: Problem name/number the subject is working on
         """
         if not self.client or not self.connected:
             logging.error("Not connected!")
             return False
 
         try:
-            # Start CSV recording if requested
+            # Start recording according to output_mode
             if record:
-                self.csv_writer.start_session()
+                self._session_start_time = time.time()
+                if self.output_mode in ("csv", "both"):
+                    self.csv_writer.start_session(subject_name, problem)
+                if self.output_mode in ("db", "both") and self.db_writer:
+                    self.db_writer.start_session(subject_name, problem)
                 self.recording = True
 
             # Enable notifications on both data characteristics
@@ -402,6 +754,14 @@ class FNIRSClient:
             await self.client.start_notify(DATA_CHAR_UUID2, self._notification_handler)
 
             logging.info("Notifications enabled")
+
+            # Store current LED configuration for CSV recording
+            self.led_config = {
+                "rp_740": self._expand(rp_740),
+                "rp_850": self._expand(rp_850),
+                "lp_740": self._expand(lp_740),
+                "lp_850": self._expand(lp_850),
+            }
 
             # Send config packet to start streaming
             config = self._build_config_packet(rp_740, rp_850, lp_740, lp_850)
@@ -417,8 +777,7 @@ class FNIRSClient:
         except Exception as e:
             logging.error("Failed to start streaming: %s", e)
             if self.recording:
-                self.csv_writer.stop_session()
-                self.recording = False
+                self._stop_recording()
             return False
 
     async def stop_streaming(self) -> bool:
@@ -430,36 +789,59 @@ class FNIRSClient:
         try:
             # Check if still connected before sending commands
             if not self.client.is_connected:
-                logging.debug("Already disconnected, skipping stop commands")
+                logging.info("Already disconnected, skipping stop commands")
                 self.streaming = False
                 if self.recording:
-                    self.csv_writer.stop_session()
-                    self.recording = False
+                    self._stop_recording()
                 return True
 
-            # Send stop command
+            # Send stop command — retry up to 3 times because BLE link
+            # may be congested with incoming data notifications.
             stop_cmd = bytes([0x03])
-            await self.client.write_gatt_char(LED_CHAR_UUID, stop_cmd)
+            sent = False
+            for attempt in range(3):
+                try:
+                    await self.client.write_gatt_char(LED_CHAR_UUID, stop_cmd)
+                    sent = True
+                    logging.info("Stop command sent (attempt %d)", attempt + 1)
+                    break
+                except Exception as exc:
+                    logging.warning(
+                        "Stop command write failed (attempt %d): %s",
+                        attempt + 1, exc,
+                    )
+                    await asyncio.sleep(0.1)
+
+            if not sent:
+                logging.error("Failed to send stop command after 3 attempts")
+
+            # Brief pause to let firmware process the stop before we
+            # unsubscribe (reduces BLE congestion from notifications).
+            await asyncio.sleep(0.15)
 
             # Disable notifications
-            await self.client.stop_notify(DATA_CHAR_UUID1)
-            await self.client.stop_notify(DATA_CHAR_UUID2)
+            try:
+                await self.client.stop_notify(DATA_CHAR_UUID1)
+            except Exception as exc:
+                logging.warning("stop_notify(DATA1): %s", exc)
+            try:
+                await self.client.stop_notify(DATA_CHAR_UUID2)
+            except Exception as exc:
+                logging.warning("stop_notify(DATA2): %s", exc)
 
             self.streaming = False
             logging.info("Streaming stopped")
 
-            # Stop CSV recording
+            # Stop active output(s)
             if self.recording:
-                self.csv_writer.stop_session()
-                self.recording = False
+                self._stop_recording()
 
             return True
         except Exception as e:
-            logging.debug("Stop streaming cleanup: %s", e)
+            logging.warning("Stop streaming error: %s", e)
             self.streaming = False
             if self.recording:
-                self.csv_writer.stop_session()
-                self.recording = False
+                self._stop_recording()
             return False
 
     async def disconnect(self):

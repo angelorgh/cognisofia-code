@@ -9,15 +9,18 @@ Requires:
     pip install dearpygui bleak
 """
 import asyncio
+import json
 import logging
 import time
 from collections import deque
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 import dearpygui.dearpygui as dpg
 
 from NIRDuinoClient import (
     FNIRSClient,
+    DBWriter,
     DEVICE_NAME,
     LED_CHAR_UUID,
     NUM_PHYSICAL_SOURCES,
@@ -69,9 +72,51 @@ STALL_FRAMES = int(30.0 / FRAME_PERIOD)
 ADC_MAX  = 8_388_608.0
 ADC_VREF = 5.0
 
+# LED DAC reference voltage (MCP4728 with VDD = 5 V)
+LED_VMAX = 5.0
+
+# LED voltage defaults — firmware maps 0-255 → 0-4095 DAC → 0-5 V
+LED_DEFAULT_RP_740 = 5.00   # 255/255 * 5V
+LED_DEFAULT_RP_850 = 5.00
+LED_DEFAULT_LP_740 = 1.47   # 75/255 * 5V ≈ 1.47V
+LED_DEFAULT_LP_850 = 1.25   # 64/255 * 5V ≈ 1.25V
+
+
+def _voltage_to_intensity(v: float) -> int:
+    """Convert a voltage (0‥5 V) to a firmware intensity byte (0‥255)."""
+    return max(0, min(255, round(v * 255.0 / LED_VMAX)))
+
+
+def _intensity_to_voltage(i: int) -> float:
+    """Convert a firmware intensity byte (0‥255) to voltage (0‥5 V)."""
+    return i * LED_VMAX / 255.0
+
 
 def _adc_to_v(raw: int) -> float:
     return raw * ADC_VREF / ADC_MAX
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Persistent config  (~/.cogni/config.json)
+# ─────────────────────────────────────────────────────────────────────────────
+_CONFIG_PATH = Path.home() / ".cogni" / "config.json"
+
+
+def _load_config() -> dict:
+    try:
+        if _CONFIG_PATH.exists():
+            return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logging.warning("Could not read config: %s", exc)
+    return {}
+
+
+def _save_config(cfg: dict) -> None:
+    try:
+        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logging.warning("Could not save config: %s", exc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,6 +162,16 @@ class GUIApp:
         # coroutine-factory callables here and drain them inside run().
         self._pending: deque = deque()
 
+        # TimescaleDB writer — shared across streaming sessions
+        self.db_writer = DBWriter()
+
+        # Map radio-button label → FNIRSClient output_mode string
+        self._output_mode_map = {
+            "CSV only":       "csv",
+            "Database only":  "db",
+            "CSV + Database": "both",
+        }
+
     # ── Frame callback (called from asyncio, safe to update deques) ───────────
     def _on_frame(self, frame_no: int, data: List[List[int]]):
         s = self._sel_source    # 0‥7
@@ -148,8 +203,17 @@ class GUIApp:
     def _update_stats(self):
         if self.client is None:
             return
-        dpg.set_value("lbl_frames",  f"Frames: {self.client.frame_count}")
-        dpg.set_value("lbl_rows",    f"CSV rows: {self.client.csv_writer.rows_written}")
+        dpg.set_value("lbl_frames", f"Frames: {self.client.frame_count}")
+
+        mode = self.client.output_mode
+        csv_n = self.client.csv_writer.rows_written if mode in ("csv", "both") else None
+        db_n  = self.db_writer.rows_written         if mode in ("db",  "both") else None
+        dpg.set_value(
+            "lbl_rows",
+            f"CSV: {csv_n if csv_n is not None else '—'}  "
+            f"DB: {db_n  if db_n  is not None else '—'}",
+        )
+
         bat = self.client.battery_level
         dpg.set_value("lbl_battery", f"Battery: {bat}%" if bat is not None else "Battery: --")
 
@@ -162,7 +226,16 @@ class GUIApp:
         dpg.set_value("series_740_lp", [xs, list(self._p740_lp)])
         dpg.set_value("series_850_lp", [xs, list(self._p850_lp)])
         dpg.fit_axis_data("x_axis")
-        dpg.fit_axis_data("y_axis")
+
+        # Manual Y-axis limits with padding so LP readings near 5 V
+        # are not clipped at the top of the chart.
+        all_vals = (list(self._p740_rp) + list(self._p850_rp)
+                    + list(self._p740_lp) + list(self._p850_lp))
+        if all_vals:
+            ymin = min(all_vals)
+            ymax = max(all_vals)
+            margin = (ymax - ymin) * 0.10 if ymax > ymin else 0.05
+            dpg.set_axis_limits("y_axis", ymin - margin, ymax + margin)
 
     def _update_log(self):
         lines = _gui_log_handler.lines
@@ -174,7 +247,7 @@ class GUIApp:
     # ── Async actions ─────────────────────────────────────────────────────────
     async def _do_scan(self):
         self.scanning = True
-        self._set_status("Scanning for device…", (255, 200, 0))
+        self._set_status("Scanning for device...", (255, 200, 0))
         self._refresh_buttons()
 
         tmp = FNIRSClient()
@@ -183,7 +256,7 @@ class GUIApp:
         if device:
             self.device = device
             dpg.set_value("device_label", f"{device.name}   ({device.address})")
-            self._set_status("Device found — press Connect", (80, 220, 80))
+            self._set_status("Device found - press Connect", (80, 220, 80))
         else:
             self._set_status(f'"{DEVICE_NAME}" not found — is it advertising?', (255, 80, 80))
 
@@ -194,7 +267,7 @@ class GUIApp:
         if self.device is None:
             return
         self.connecting = True
-        self._set_status("Connecting…", (255, 200, 0))
+        self._set_status("Connecting...", (255, 200, 0))
         self._refresh_buttons()
 
         self.client = FNIRSClient(output_dir="data")
@@ -231,9 +304,36 @@ class GUIApp:
         self._stall_tick    = 0
         self._keepalive_tick = 0
 
-        ok = await self.client.start_streaming(record=True)
+        # Determine output mode from the radio button
+        output_mode = self._output_mode_map.get(
+            dpg.get_value("output_mode"), "csv"
+        )
+
+        # Validate DB connection when it's required
+        if output_mode in ("db", "both") and not self.db_writer.is_connected:
+            self._set_status(
+                "Database not connected — open Connections → Database",
+                (255, 80, 80),
+            )
+            self._refresh_buttons()
+            return
+
+        # Attach output configuration to the client
+        self.client.output_mode = output_mode
+        self.client.db_writer   = self.db_writer if output_mode in ("db", "both") else None
+
+        rp_740, rp_850, lp_740, lp_850 = self._read_led_config()
+        subject_name = dpg.get_value("input_subject")
+        problem      = dpg.get_value("input_problem")
+        ok = await self.client.start_streaming(
+            record=True,
+            rp_740=rp_740, rp_850=rp_850,
+            lp_740=lp_740, lp_850=lp_850,
+            subject_name=subject_name,
+            problem=problem,
+        )
         if ok:
-            self._set_status("Streaming…", (0, 210, 255))
+            self._set_status("Streaming...", (0, 210, 255))
         else:
             self._set_status("Failed to start streaming", (255, 80, 80))
         self._refresh_buttons()
@@ -275,6 +375,133 @@ class GUIApp:
         self._sel_detector = int(value[1:]) - 1  # "D1" → 0 … "D16" → 15
         self._clear_plot_buffers()
 
+    # ── LED configuration helpers ──────────────────────────────────────────────
+    def _read_led_config(self) -> Tuple[List[int], List[int], List[int], List[int]]:
+        """Read the 8×4 LED voltage fields and convert to intensity bytes (0-255)."""
+        rp_740, rp_850, lp_740, lp_850 = [], [], [], []
+        for s in range(1, NUM_PHYSICAL_SOURCES + 1):
+            rp_740.append(_voltage_to_intensity(dpg.get_value(f"led_s{s}_740rp")))
+            rp_850.append(_voltage_to_intensity(dpg.get_value(f"led_s{s}_850rp")))
+            lp_740.append(_voltage_to_intensity(dpg.get_value(f"led_s{s}_740lp")))
+            lp_850.append(_voltage_to_intensity(dpg.get_value(f"led_s{s}_850lp")))
+        return rp_740, rp_850, lp_740, lp_850
+
+    def _cb_reset_defaults(self, *_):
+        """Reset all LED input fields to default voltage values."""
+        for s in range(1, NUM_PHYSICAL_SOURCES + 1):
+            dpg.set_value(f"led_s{s}_740rp", LED_DEFAULT_RP_740)
+            dpg.set_value(f"led_s{s}_850rp", LED_DEFAULT_RP_850)
+            dpg.set_value(f"led_s{s}_740lp", LED_DEFAULT_LP_740)
+            dpg.set_value(f"led_s{s}_850lp", LED_DEFAULT_LP_850)
+
+    def _cb_update_leds(self, *_):
+        self._pending.append(self._do_update_leds)
+
+    async def _do_update_leds(self):
+        """Send updated LED intensities to the device without stopping the stream."""
+        if not self.client or not self.client.client or not self.client.client.is_connected:
+            logging.warning("Cannot update LEDs — not connected")
+            return
+        rp_740, rp_850, lp_740, lp_850 = self._read_led_config()
+
+        # Update stored config so subsequent CSV rows reflect the change
+        self.client.led_config = {
+            "rp_740": rp_740,
+            "rp_850": rp_850,
+            "lp_740": lp_740,
+            "lp_850": lp_850,
+        }
+
+        packet = self.client._build_config_packet(rp_740, rp_850, lp_740, lp_850)
+        await self.client.client.write_gatt_char(LED_CHAR_UUID, packet)
+        logging.info("LED intensities updated")
+
+    # ── Database connection callbacks ─────────────────────────────────────────
+    def _cb_open_db_window(self, *_):
+        dpg.configure_item("win_db_config", show=True)
+
+    def _cb_test_db(self, *_):
+        self._pending.append(self._do_test_db)
+
+    def _cb_connect_db(self, *_):
+        self._pending.append(self._do_connect_db)
+
+    def _cb_disconnect_db(self, *_):
+        self._pending.append(self._do_disconnect_db)
+
+    async def _do_test_db(self):
+        host     = dpg.get_value("db_host")
+        port     = dpg.get_value("db_port")
+        dbname   = dpg.get_value("db_name")
+        user     = dpg.get_value("db_user")
+        password = dpg.get_value("db_pass")
+        self._set_db_status("Testing...", (255, 200, 0))
+        loop = asyncio.get_running_loop()
+        ok, msg = await loop.run_in_executor(
+            None, self.db_writer.test_connection, host, port, dbname, user, password
+        )
+        if ok:
+            self._set_db_status(f"✓ {msg}", (80, 220, 80))
+        else:
+            self._set_db_status(f"✗ {msg}", (255, 80, 80))
+
+    async def _do_connect_db(self):
+        host     = dpg.get_value("db_host")
+        port     = dpg.get_value("db_port")
+        dbname   = dpg.get_value("db_name")
+        user     = dpg.get_value("db_user")
+        password = dpg.get_value("db_pass")
+        self._set_db_status("Connecting...", (255, 200, 0))
+        loop = asyncio.get_running_loop()
+        ok, msg = await loop.run_in_executor(
+            None, self.db_writer.connect, host, port, dbname, user, password
+        )
+        if ok:
+            self._set_db_status(
+                f"● Connected  ·  {dbname}@{host}:{port}", (80, 220, 80)
+            )
+            dpg.configure_item("btn_db_connect",    enabled=False)
+            dpg.configure_item("btn_db_disconnect", enabled=True)
+            self._save_db_config()   # persist for next restart
+        else:
+            self._set_db_status(f"✗ {msg}", (255, 80, 80))
+
+    async def _do_disconnect_db(self):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.db_writer.disconnect)
+        self._set_db_status("● Not connected", (180, 180, 180))
+        dpg.configure_item("btn_db_connect",    enabled=True)
+        dpg.configure_item("btn_db_disconnect", enabled=False)
+
+    def _set_db_status(self, text: str, color=(180, 180, 180)):
+        dpg.set_value("db_conn_status", text)
+        dpg.configure_item("db_conn_status", color=color)
+
+    def _load_db_config(self) -> bool:
+        """Pre-fill the connections window from ~/.cogni/config.json.
+
+        Returns True if enough credentials exist to attempt auto-connect.
+        """
+        db = _load_config().get("db", {})
+        if db.get("host"):     dpg.set_value("db_host", db["host"])
+        if db.get("port"):     dpg.set_value("db_port", db["port"])
+        if db.get("dbname"):   dpg.set_value("db_name", db["dbname"])
+        if db.get("user"):     dpg.set_value("db_user", db["user"])
+        if db.get("password"): dpg.set_value("db_pass", db["password"])
+        return bool(db.get("host") and db.get("user"))
+
+    def _save_db_config(self):
+        """Persist the current connections-window values to ~/.cogni/config.json."""
+        cfg = _load_config()
+        cfg["db"] = {
+            "host":     dpg.get_value("db_host"),
+            "port":     dpg.get_value("db_port"),
+            "dbname":   dpg.get_value("db_name"),
+            "user":     dpg.get_value("db_user"),
+            "password": dpg.get_value("db_pass"),
+        }
+        _save_config(cfg)
+
     # ── Button callbacks (sync — push to pending queue, drained by run()) ───────
     def _cb_scan(self, *_):        self._pending.append(self._do_scan)
     def _cb_connect(self, *_):     self._pending.append(self._do_connect)
@@ -286,6 +513,10 @@ class GUIApp:
     # ── GUI layout ────────────────────────────────────────────────────────────
     def _build_gui(self):
         dpg.create_context()
+
+        with dpg.font_registry():
+            default_font = dpg.add_font("./fonts/JetBrainsMonoNL-Regular.ttf", 16)
+            
         dpg.create_viewport(
             title="NIRDuino fNIRS Client",
             width=960,
@@ -296,7 +527,16 @@ class GUIApp:
         dpg.setup_dearpygui()
 
         with dpg.window(tag="main_window", no_close=True,
-                        no_move=True, no_resize=True, no_title_bar=True):
+                        no_move=True, no_resize=True, no_title_bar=True,
+                        menubar=True):
+
+            # ── Menu bar ─────────────────────────────────────────────────────
+            with dpg.menu_bar():
+                with dpg.menu(label="Connections"):
+                    dpg.add_menu_item(
+                        label="Database",
+                        callback=self._cb_open_db_window,
+                    )
 
             dpg.add_text("NIRDuino fNIRS Client", color=(0, 210, 255))
             dpg.add_separator()
@@ -322,6 +562,31 @@ class GUIApp:
             dpg.add_spacer(height=4)
             dpg.add_separator()
 
+            # ── Session info ─────────────────────────────────────────────────
+            with dpg.collapsing_header(label="Session", default_open=True):
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Subject Name:")
+                    dpg.add_input_text(tag="input_subject", width=200,
+                                       hint="e.g. John Doe")
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Problem:")
+                    dpg.add_spacer(width=32)
+                    dpg.add_input_text(tag="input_problem", width=200,
+                                       hint="e.g. Problem 1")
+                dpg.add_spacer(height=6)
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Output:")
+                    dpg.add_spacer(width=10)
+                    dpg.add_radio_button(
+                        tag="output_mode",
+                        items=["CSV only", "Database only", "CSV + Database"],
+                        default_value="CSV only",
+                        horizontal=True,
+                    )
+
+            dpg.add_spacer(height=4)
+            dpg.add_separator()
+
             # ── Streaming ────────────────────────────────────────────────────
             with dpg.collapsing_header(label="Streaming", default_open=True):
                 with dpg.group(horizontal=True):
@@ -333,17 +598,77 @@ class GUIApp:
                                    callback=self._cb_stimulus)
                 dpg.add_spacer(height=6)
                 with dpg.group(horizontal=True):
-                    dpg.add_text("Frames: 0",   tag="lbl_frames")
+                    dpg.add_text("Frames: 0",    tag="lbl_frames")
                     dpg.add_spacer(width=24)
-                    dpg.add_text("CSV rows: 0", tag="lbl_rows")
+                    dpg.add_text("CSV: --  DB: --", tag="lbl_rows")
                     dpg.add_spacer(width=24)
-                    dpg.add_text("Battery: --", tag="lbl_battery")
+                    dpg.add_text("Battery: --",   tag="lbl_battery")
+
+            dpg.add_spacer(height=4)
+            dpg.add_separator()
+
+            # ── LED Configuration (voltages) ─────────────────────────────────
+            with dpg.collapsing_header(label="LED Configuration",
+                                       default_open=False):
+                # Column headers
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Source", color=(160, 160, 160))
+                    dpg.add_spacer(width=6)
+                    dpg.add_text("740 RP (V)", color=(160, 160, 160))
+                    dpg.add_spacer(width=24)
+                    dpg.add_text("850 RP (V)", color=(160, 160, 160))
+                    dpg.add_spacer(width=24)
+                    dpg.add_text("740 LP (V)", color=(160, 160, 160))
+                    dpg.add_spacer(width=24)
+                    dpg.add_text("850 LP (V)", color=(160, 160, 160))
+
+                # 8 source rows — voltage inputs (0.00 – 5.00 V)
+                for s in range(1, NUM_PHYSICAL_SOURCES + 1):
+                    with dpg.group(horizontal=True):
+                        dpg.add_text(f"  S{s}")
+                        dpg.add_spacer(width=12)
+                        dpg.add_input_float(
+                            tag=f"led_s{s}_740rp", width=90,
+                            default_value=LED_DEFAULT_RP_740, step=0.1,
+                            min_value=0.0, max_value=LED_VMAX,
+                            min_clamped=True, max_clamped=True,
+                            format="%.2f",
+                        )
+                        dpg.add_input_float(
+                            tag=f"led_s{s}_850rp", width=90,
+                            default_value=LED_DEFAULT_RP_850, step=0.1,
+                            min_value=0.0, max_value=LED_VMAX,
+                            min_clamped=True, max_clamped=True,
+                            format="%.2f",
+                        )
+                        dpg.add_input_float(
+                            tag=f"led_s{s}_740lp", width=90,
+                            default_value=LED_DEFAULT_LP_740, step=0.1,
+                            min_value=0.0, max_value=LED_VMAX,
+                            min_clamped=True, max_clamped=True,
+                            format="%.2f",
+                        )
+                        dpg.add_input_float(
+                            tag=f"led_s{s}_850lp", width=90,
+                            default_value=LED_DEFAULT_LP_850, step=0.1,
+                            min_value=0.0, max_value=LED_VMAX,
+                            min_clamped=True, max_clamped=True,
+                            format="%.2f",
+                        )
+
+                dpg.add_spacer(height=6)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label=" Reset Defaults ",
+                                   callback=self._cb_reset_defaults)
+                    dpg.add_button(label=" Update LEDs ",
+                                   tag="btn_update_leds",
+                                   callback=self._cb_update_leds)
 
             dpg.add_spacer(height=4)
             dpg.add_separator()
 
             # ── Live plot ────────────────────────────────────────────────────
-            with dpg.collapsing_header(label="Live Data — S1 D1 (voltage)",
+            with dpg.collapsing_header(label="Live Data - S1 D1 (voltage)",
                                        default_open=True,
                                        tag="plot_header"):
                 with dpg.group(horizontal=True):
@@ -365,7 +690,7 @@ class GUIApp:
                         callback=self._cb_detector_changed,
                     )
                 dpg.add_spacer(height=4)
-                with dpg.plot(label="", height=230, width=-1,
+                with dpg.plot(label="", height=400, width=-1,
                               anti_aliased=True):
                     dpg.add_plot_legend()
                     dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)",
@@ -394,10 +719,72 @@ class GUIApp:
                     height=150,
                     default_value="",
                 )
+            dpg.bind_font(default_font)
+        #dpg.show_font_manager()
+        dpg.maximize_viewport()
+
+        # ── Database connections window (top-level, toggled by menu) ──────────
+        with dpg.window(
+            label="Database Connection",
+            tag="win_db_config",
+            show=False,
+            width=500,
+            height=270,
+            no_collapse=True,
+            pos=[120, 80],
+        ):
+            dpg.add_text("TimescaleDB connection settings", color=(160, 160, 160))
+            dpg.add_separator()
+            dpg.add_spacer(height=6)
+
+            with dpg.group(horizontal=True):
+                dpg.add_text("Host:    ")
+                dpg.add_input_text(tag="db_host", default_value="localhost", width=230)
+                dpg.add_spacer(width=12)
+                dpg.add_text("Port:")
+                dpg.add_input_text(tag="db_port", default_value="5432", width=60)
+
+            dpg.add_spacer(height=4)
+            with dpg.group(horizontal=True):
+                dpg.add_text("Database:")
+                dpg.add_input_text(tag="db_name", default_value="fnirs_db", width=200)
+
+            dpg.add_spacer(height=4)
+            with dpg.group(horizontal=True):
+                dpg.add_text("User:    ")
+                dpg.add_input_text(tag="db_user", default_value="postgres", width=200)
+
+            dpg.add_spacer(height=4)
+            with dpg.group(horizontal=True):
+                dpg.add_text("Password:")
+                dpg.add_input_text(tag="db_pass", password=True, width=200)
+
+            dpg.add_spacer(height=10)
+            dpg.add_text("● Not connected", tag="db_conn_status",
+                         color=(180, 180, 180))
+            dpg.add_spacer(height=10)
+
+            with dpg.group(horizontal=True):
+                dpg.add_button(label=" Test ",
+                               callback=self._cb_test_db)
+                dpg.add_button(label=" Connect ",    tag="btn_db_connect",
+                               callback=self._cb_connect_db)
+                dpg.add_button(label=" Disconnect ", tag="btn_db_disconnect",
+                               callback=self._cb_disconnect_db, enabled=False)
+                dpg.add_spacer(width=16)
+                dpg.add_button(
+                    label=" Close ",
+                    callback=lambda: dpg.configure_item("win_db_config", show=False),
+                )
 
         dpg.set_primary_window("main_window", True)
         dpg.show_viewport()
         self._refresh_buttons()
+
+        # Pre-fill DB fields from persisted config (must run after all widgets exist).
+        # If credentials are present, queue an auto-connect on the first loop tick.
+        if self._load_db_config():
+            self._pending.append(self._do_connect_db)
 
     # ── Main loop ─────────────────────────────────────────────────────────────
     async def run(self):
