@@ -392,7 +392,7 @@ class CSVWriter:
                 - Sources 16-23: 740nm Low Power
                 - Sources 24-31: 850nm Low Power
                 - Source 32: Dark current
-            stimulus: Stimulus marker value (0=off, 10=on)
+            stimulus: Stimulus marker value (0=off, 1=on)
             led_config: dict with keys 'rp_740', 'rp_850', 'lp_740', 'lp_850',
                         each a list of 8 intensity bytes (0-255).
                         If None, zeros are written.
@@ -617,7 +617,7 @@ class FNIRSClient:
 
         # Write to active output(s)
         if self.recording:
-            stimulus = 10 if self.stimulus_active else 0
+            stimulus = 1 if self.stimulus_active else 0
             elapsed = (time.time() - self._session_start_time
                        if self._session_start_time else 0.0)
             if self.output_mode in ("csv", "both"):

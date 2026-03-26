@@ -162,14 +162,17 @@ class GUIApp:
         # coroutine-factory callables here and drain them inside run().
         self._pending: deque = deque()
 
+        # Stimulus shading: list of [t_start, t_end_or_None] in plot-time (s)
+        self._stimulus_intervals: list = []
+
         # TimescaleDB writer — shared across streaming sessions
         self.db_writer = DBWriter()
 
         # Map radio-button label → FNIRSClient output_mode string
         self._output_mode_map = {
-            "CSV only":       "csv",
-            "Database only":  "db",
-            "CSV + Database": "both",
+            "Solo CSV":            "csv",
+            "Solo base de datos":  "db",
+            "CSV + Base de datos": "both",
         }
 
     # ── Frame callback (called from asyncio, safe to update deques) ───────────
@@ -203,7 +206,7 @@ class GUIApp:
     def _update_stats(self):
         if self.client is None:
             return
-        dpg.set_value("lbl_frames", f"Frames: {self.client.frame_count}")
+        dpg.set_value("lbl_frames", f"Tramas: {self.client.frame_count}")
 
         mode = self.client.output_mode
         csv_n = self.client.csv_writer.rows_written if mode in ("csv", "both") else None
@@ -211,13 +214,30 @@ class GUIApp:
         dpg.set_value(
             "lbl_rows",
             f"CSV: {csv_n if csv_n is not None else '—'}  "
-            f"DB: {db_n  if db_n  is not None else '—'}",
+            f"BD: {db_n  if db_n  is not None else '—'}",
         )
 
         bat = self.client.battery_level
-        dpg.set_value("lbl_battery", f"Battery: {bat}%" if bat is not None else "Battery: --")
+        dpg.set_value("lbl_battery", f"Batería: {bat}%" if bat is not None else "Batería: --")
 
     def _update_plot(self):
+        # ── Stimulus shading (rebuilt every frame, even before data arrives) ──
+        _nan = float("nan")
+        _BIG = 1e6
+        sx: list = []
+        sy1: list = []
+        sy2: list = []
+        t_now = self._px[-1] if self._px else 0.0
+        for i, (t_start, t_end) in enumerate(self._stimulus_intervals):
+            # If stimulus is still active, extend band to the current plot time
+            t_e = t_end if t_end is not None else t_now
+            if i > 0:
+                sx.append(_nan);  sy1.append(_nan);  sy2.append(_nan)
+            sx  += [t_start, t_e]
+            sy1 += [_BIG,    _BIG]
+            sy2 += [-_BIG,  -_BIG]
+        dpg.set_value("series_stim", [sx, sy1, sy2])
+
         if not self._px:
             return
         xs = list(self._px)
@@ -247,7 +267,7 @@ class GUIApp:
     # ── Async actions ─────────────────────────────────────────────────────────
     async def _do_scan(self):
         self.scanning = True
-        self._set_status("Scanning for device...", (255, 200, 0))
+        self._set_status("Buscando dispositivo...", (255, 200, 0))
         self._refresh_buttons()
 
         tmp = FNIRSClient()
@@ -256,9 +276,9 @@ class GUIApp:
         if device:
             self.device = device
             dpg.set_value("device_label", f"{device.name}   ({device.address})")
-            self._set_status("Device found - press Connect", (80, 220, 80))
+            self._set_status("Dispositivo encontrado — presiona Conectar", (80, 220, 80))
         else:
-            self._set_status(f'"{DEVICE_NAME}" not found — is it advertising?', (255, 80, 80))
+            self._set_status(f'"{DEVICE_NAME}" no encontrado — ¿está en modo anuncio BLE?', (255, 80, 80))
 
         self.scanning = False
         self._refresh_buttons()
@@ -267,7 +287,7 @@ class GUIApp:
         if self.device is None:
             return
         self.connecting = True
-        self._set_status("Connecting...", (255, 200, 0))
+        self._set_status("Conectando...", (255, 200, 0))
         self._refresh_buttons()
 
         self.client = FNIRSClient(output_dir="data")
@@ -275,9 +295,9 @@ class GUIApp:
 
         ok = await self.client.connect(self.device)
         if ok:
-            self._set_status(f"Connected  ·  {self.device.name}", (80, 220, 80))
+            self._set_status(f"Conectado  ·  {self.device.name}", (80, 220, 80))
         else:
-            self._set_status("Connection failed", (255, 80, 80))
+            self._set_status("Error de conexión", (255, 80, 80))
             self.client = None
 
         self.connecting = False
@@ -287,7 +307,7 @@ class GUIApp:
         if self.client:
             await self.client.disconnect()
             self.client = None
-        self._set_status("Disconnected", (180, 180, 180))
+        self._set_status("Desconectado", (180, 180, 180))
         self._refresh_buttons()
 
     async def _do_start_streaming(self):
@@ -300,6 +320,7 @@ class GUIApp:
         self._p850_rp.clear()
         self._p740_lp.clear()
         self._p850_lp.clear()
+        self._stimulus_intervals.clear()
         self._last_frame_no = 0
         self._stall_tick    = 0
         self._keepalive_tick = 0
@@ -312,7 +333,7 @@ class GUIApp:
         # Validate DB connection when it's required
         if output_mode in ("db", "both") and not self.db_writer.is_connected:
             self._set_status(
-                "Database not connected — open Connections → Database",
+                "Base de datos no conectada — abrir Conexiones → Base de datos",
                 (255, 80, 80),
             )
             self._refresh_buttons()
@@ -333,24 +354,32 @@ class GUIApp:
             problem=problem,
         )
         if ok:
-            self._set_status("Streaming...", (0, 210, 255))
+            self._set_status("Transmitiendo...", (0, 210, 255))
         else:
-            self._set_status("Failed to start streaming", (255, 80, 80))
+            self._set_status("Error al iniciar la transmisión", (255, 80, 80))
         self._refresh_buttons()
 
     async def _do_stop_streaming(self):
         if self.client:
             await self.client.stop_streaming()
-        self._set_status("Connected  ·  streaming stopped", (80, 220, 80))
+        self._set_status("Conectado  ·  transmisión detenida", (80, 220, 80))
         self._refresh_buttons()
 
     def _toggle_stimulus(self):
         if self.client:
             new_state = not self.client.stimulus_active
             self.client.set_stimulus(new_state)
+            t_now = time.time() - self._plot_t0
+            if new_state:
+                # Open a new interval
+                self._stimulus_intervals.append([t_now, None])
+            else:
+                # Close the current interval
+                if self._stimulus_intervals and self._stimulus_intervals[-1][1] is None:
+                    self._stimulus_intervals[-1][1] = t_now
             dpg.configure_item(
                 "btn_stimulus",
-                label="Stimulus: ON " if new_state else "Stimulus: OFF",
+                label="Estímulo: ON " if new_state else "Estímulo: OFF",
             )
 
     # ── Plot selection helpers ────────────────────────────────────────────────
@@ -363,8 +392,8 @@ class GUIApp:
         self._p850_lp.clear()
         dpg.configure_item(
             "plot_header",
-            label=f"Live Data — S{self._sel_source + 1} "
-                  f"D{self._sel_detector + 1} (voltage)",
+            label=f"Datos en vivo — S{self._sel_source + 1} "
+                  f"D{self._sel_detector + 1} (voltaje)",
         )
 
     def _cb_source_changed(self, sender, value, *_):
@@ -400,7 +429,7 @@ class GUIApp:
     async def _do_update_leds(self):
         """Send updated LED intensities to the device without stopping the stream."""
         if not self.client or not self.client.client or not self.client.client.is_connected:
-            logging.warning("Cannot update LEDs — not connected")
+            logging.warning("No se pueden actualizar los LEDs — sin conexión")
             return
         rp_740, rp_850, lp_740, lp_850 = self._read_led_config()
 
@@ -414,7 +443,7 @@ class GUIApp:
 
         packet = self.client._build_config_packet(rp_740, rp_850, lp_740, lp_850)
         await self.client.client.write_gatt_char(LED_CHAR_UUID, packet)
-        logging.info("LED intensities updated")
+        logging.info("Intensidades de LED actualizadas")
 
     # ── Database connection callbacks ─────────────────────────────────────────
     def _cb_open_db_window(self, *_):
@@ -435,7 +464,7 @@ class GUIApp:
         dbname   = dpg.get_value("db_name")
         user     = dpg.get_value("db_user")
         password = dpg.get_value("db_pass")
-        self._set_db_status("Testing...", (255, 200, 0))
+        self._set_db_status("Probando...", (255, 200, 0))
         loop = asyncio.get_running_loop()
         ok, msg = await loop.run_in_executor(
             None, self.db_writer.test_connection, host, port, dbname, user, password
@@ -451,14 +480,14 @@ class GUIApp:
         dbname   = dpg.get_value("db_name")
         user     = dpg.get_value("db_user")
         password = dpg.get_value("db_pass")
-        self._set_db_status("Connecting...", (255, 200, 0))
+        self._set_db_status("Conectando...", (255, 200, 0))
         loop = asyncio.get_running_loop()
         ok, msg = await loop.run_in_executor(
             None, self.db_writer.connect, host, port, dbname, user, password
         )
         if ok:
             self._set_db_status(
-                f"● Connected  ·  {dbname}@{host}:{port}", (80, 220, 80)
+                f"● Conectado  ·  {dbname}@{host}:{port}", (80, 220, 80)
             )
             dpg.configure_item("btn_db_connect",    enabled=False)
             dpg.configure_item("btn_db_disconnect", enabled=True)
@@ -469,7 +498,7 @@ class GUIApp:
     async def _do_disconnect_db(self):
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.db_writer.disconnect)
-        self._set_db_status("● Not connected", (180, 180, 180))
+        self._set_db_status("● Sin conexión", (180, 180, 180))
         dpg.configure_item("btn_db_connect",    enabled=True)
         dpg.configure_item("btn_db_disconnect", enabled=False)
 
@@ -518,7 +547,7 @@ class GUIApp:
             default_font = dpg.add_font("./fonts/JetBrainsMonoNL-Regular.ttf", 16)
             
         dpg.create_viewport(
-            title="NIRDuino fNIRS Client",
+            title="NIRDuino fNIRS Cliente",
             width=960,
             height=740,
             min_width=640,
@@ -526,93 +555,105 @@ class GUIApp:
         )
         dpg.setup_dearpygui()
 
+        # ── Stimulus band theme — semi-transparent grey fill, no border line ─
+        with dpg.theme(tag="theme_stim_band"):
+            with dpg.theme_component(dpg.mvShadeSeries):
+                dpg.add_theme_color(
+                    dpg.mvPlotCol_Fill, (180, 180, 180, 60),
+                    category=dpg.mvThemeCat_Plots,
+                )
+                dpg.add_theme_color(
+                    dpg.mvPlotCol_Line, (0, 0, 0, 0),
+                    category=dpg.mvThemeCat_Plots,
+                )
+
         with dpg.window(tag="main_window", no_close=True,
                         no_move=True, no_resize=True, no_title_bar=True,
                         menubar=True):
 
             # ── Menu bar ─────────────────────────────────────────────────────
             with dpg.menu_bar():
-                with dpg.menu(label="Connections"):
+                with dpg.menu(label="Conexiones"):
                     dpg.add_menu_item(
-                        label="Database",
+                        label="Base de datos",
                         callback=self._cb_open_db_window,
                     )
 
-            dpg.add_text("NIRDuino fNIRS Client", color=(0, 210, 255))
+            dpg.add_text("NIRDuino fNIRS Cliente", color=(0, 210, 255))
             dpg.add_separator()
             dpg.add_spacer(height=4)
 
-            # ── Connection ───────────────────────────────────────────────────
-            with dpg.collapsing_header(label="Connection", default_open=True):
+            # ── Conexión ─────────────────────────────────────────────────────
+            with dpg.collapsing_header(label="Conexión", default_open=True):
                 with dpg.group(horizontal=True):
-                    dpg.add_text("Status: ")
-                    dpg.add_text("Disconnected", tag="status_text",
+                    dpg.add_text("Estado: ")
+                    dpg.add_text("Desconectado", tag="status_text",
                                  color=(180, 180, 180))
-                dpg.add_text("No device found yet", tag="device_label",
+                dpg.add_text("Ningún dispositivo encontrado", tag="device_label",
                              color=(160, 160, 160))
                 dpg.add_spacer(height=6)
                 with dpg.group(horizontal=True):
-                    dpg.add_button(label=" Scan ",       tag="btn_scan",
+                    dpg.add_button(label=" Buscar ",       tag="btn_scan",
                                    callback=self._cb_scan)
-                    dpg.add_button(label=" Connect ",    tag="btn_connect",
+                    dpg.add_button(label=" Conectar ",     tag="btn_connect",
                                    callback=self._cb_connect)
-                    dpg.add_button(label=" Disconnect ", tag="btn_disconnect",
+                    dpg.add_button(label=" Desconectar ",  tag="btn_disconnect",
                                    callback=self._cb_disconnect)
 
             dpg.add_spacer(height=4)
             dpg.add_separator()
 
-            # ── Session info ─────────────────────────────────────────────────
-            with dpg.collapsing_header(label="Session", default_open=True):
+            # ── Información de sesión ─────────────────────────────────────────
+            with dpg.collapsing_header(label="Sesión", default_open=True):
                 with dpg.group(horizontal=True):
-                    dpg.add_text("Subject Name:")
+                    dpg.add_text("Nombre del sujeto:")
                     dpg.add_input_text(tag="input_subject", width=200,
-                                       hint="e.g. John Doe")
+                                       hint="ej. Juan Pérez")
                 with dpg.group(horizontal=True):
-                    dpg.add_text("Problem:")
+                    dpg.add_text("Problema:")
                     dpg.add_spacer(width=32)
                     dpg.add_input_text(tag="input_problem", width=200,
-                                       hint="e.g. Problem 1")
+                                       hint="ej. Problema 1")
                 dpg.add_spacer(height=6)
                 with dpg.group(horizontal=True):
-                    dpg.add_text("Output:")
+                    dpg.add_text("Salida:")
                     dpg.add_spacer(width=10)
                     dpg.add_radio_button(
                         tag="output_mode",
-                        items=["CSV only", "Database only", "CSV + Database"],
-                        default_value="CSV only",
+                        items=["Solo CSV", "Solo base de datos", "CSV + Base de datos"],
+                        default_value="Solo CSV",
                         horizontal=True,
                     )
 
             dpg.add_spacer(height=4)
             dpg.add_separator()
 
-            # ── Streaming ────────────────────────────────────────────────────
-            with dpg.collapsing_header(label="Streaming", default_open=True):
+            # ── Transmisión ──────────────────────────────────────────────────
+            with dpg.collapsing_header(label="Transmisión", default_open=True):
                 with dpg.group(horizontal=True):
-                    dpg.add_button(label=" Start Streaming ", tag="btn_start",
+                    dpg.add_button(label=" Iniciar transmisión ", tag="btn_start",
                                    callback=self._cb_start)
-                    dpg.add_button(label=" Stop Streaming ",  tag="btn_stop",
+                    dpg.add_button(label=" Detener transmisión ", tag="btn_stop",
                                    callback=self._cb_stop)
-                    dpg.add_button(label="Stimulus: OFF",     tag="btn_stimulus",
+                    dpg.add_button(label="Estímulo: OFF",         tag="btn_stimulus",
                                    callback=self._cb_stimulus)
                 dpg.add_spacer(height=6)
                 with dpg.group(horizontal=True):
-                    dpg.add_text("Frames: 0",    tag="lbl_frames")
+                    dpg.add_text("Tramas: 0",    tag="lbl_frames")
                     dpg.add_spacer(width=24)
-                    dpg.add_text("CSV: --  DB: --", tag="lbl_rows")
+                    dpg.add_text("CSV: --  BD: --", tag="lbl_rows")
                     dpg.add_spacer(width=24)
-                    dpg.add_text("Battery: --",   tag="lbl_battery")
+                    dpg.add_text("Batería: --",   tag="lbl_battery")
 
             dpg.add_spacer(height=4)
             dpg.add_separator()
 
-            # ── LED Configuration (voltages) ─────────────────────────────────
-            with dpg.collapsing_header(label="LED Configuration",
+            # ── Configuración de LEDs (voltajes) ─────────────────────────────
+            with dpg.collapsing_header(label="Configuración de LEDs",
                                        default_open=False):
-                # Column headers
+                # Encabezados de columnas
                 with dpg.group(horizontal=True):
-                    dpg.add_text("Source", color=(160, 160, 160))
+                    dpg.add_text("Fuente", color=(160, 160, 160))
                     dpg.add_spacer(width=6)
                     dpg.add_text("740 RP (V)", color=(160, 160, 160))
                     dpg.add_spacer(width=24)
@@ -658,21 +699,21 @@ class GUIApp:
 
                 dpg.add_spacer(height=6)
                 with dpg.group(horizontal=True):
-                    dpg.add_button(label=" Reset Defaults ",
+                    dpg.add_button(label=" Restablecer valores ",
                                    callback=self._cb_reset_defaults)
-                    dpg.add_button(label=" Update LEDs ",
+                    dpg.add_button(label=" Actualizar LEDs ",
                                    tag="btn_update_leds",
                                    callback=self._cb_update_leds)
 
             dpg.add_spacer(height=4)
             dpg.add_separator()
 
-            # ── Live plot ────────────────────────────────────────────────────
-            with dpg.collapsing_header(label="Live Data - S1 D1 (voltage)",
+            # ── Gráfico en vivo ───────────────────────────────────────────────
+            with dpg.collapsing_header(label="Datos en vivo - S1 D1 (voltaje)",
                                        default_open=True,
                                        tag="plot_header"):
                 with dpg.group(horizontal=True):
-                    dpg.add_text("Source:")
+                    dpg.add_text("Fuente:")
                     dpg.add_combo(
                         items=[f"S{i}" for i in range(1, NUM_PHYSICAL_SOURCES + 1)],
                         default_value="S1",
@@ -693,10 +734,14 @@ class GUIApp:
                 with dpg.plot(label="", height=400, width=-1,
                               anti_aliased=True):
                     dpg.add_plot_legend()
-                    dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)",
+                    dpg.add_plot_axis(dpg.mvXAxis, label="Tiempo (s)",
                                       tag="x_axis")
                     with dpg.plot_axis(dpg.mvYAxis, label="V",
                                        tag="y_axis"):
+                        # Sombreado de estímulo — primero para que quede detrás de las líneas
+                        dpg.add_shade_series([], [], y2=[], label="Estímulo",
+                                             tag="series_stim")
+                        dpg.bind_item_theme("series_stim", "theme_stim_band")
                         dpg.add_line_series([], [], label="740 nm RP",
                                             tag="series_740_rp")
                         dpg.add_line_series([], [], label="850 nm RP",
@@ -725,7 +770,7 @@ class GUIApp:
 
         # ── Database connections window (top-level, toggled by menu) ──────────
         with dpg.window(
-            label="Database Connection",
+            label="Conexión a la base de datos",
             tag="win_db_config",
             show=False,
             width=500,
@@ -733,47 +778,47 @@ class GUIApp:
             no_collapse=True,
             pos=[120, 80],
         ):
-            dpg.add_text("TimescaleDB connection settings", color=(160, 160, 160))
+            dpg.add_text("Configuración de conexión TimescaleDB", color=(160, 160, 160))
             dpg.add_separator()
             dpg.add_spacer(height=6)
 
             with dpg.group(horizontal=True):
-                dpg.add_text("Host:    ")
+                dpg.add_text("Host:      ")
                 dpg.add_input_text(tag="db_host", default_value="localhost", width=230)
                 dpg.add_spacer(width=12)
-                dpg.add_text("Port:")
+                dpg.add_text("Puerto:")
                 dpg.add_input_text(tag="db_port", default_value="5432", width=60)
 
             dpg.add_spacer(height=4)
             with dpg.group(horizontal=True):
-                dpg.add_text("Database:")
+                dpg.add_text("Base de datos:")
                 dpg.add_input_text(tag="db_name", default_value="fnirs_db", width=200)
 
             dpg.add_spacer(height=4)
             with dpg.group(horizontal=True):
-                dpg.add_text("User:    ")
+                dpg.add_text("Usuario:   ")
                 dpg.add_input_text(tag="db_user", default_value="postgres", width=200)
 
             dpg.add_spacer(height=4)
             with dpg.group(horizontal=True):
-                dpg.add_text("Password:")
+                dpg.add_text("Contraseña:")
                 dpg.add_input_text(tag="db_pass", password=True, width=200)
 
             dpg.add_spacer(height=10)
-            dpg.add_text("● Not connected", tag="db_conn_status",
+            dpg.add_text("● Sin conexión", tag="db_conn_status",
                          color=(180, 180, 180))
             dpg.add_spacer(height=10)
 
             with dpg.group(horizontal=True):
-                dpg.add_button(label=" Test ",
+                dpg.add_button(label=" Probar ",
                                callback=self._cb_test_db)
-                dpg.add_button(label=" Connect ",    tag="btn_db_connect",
+                dpg.add_button(label=" Conectar ",    tag="btn_db_connect",
                                callback=self._cb_connect_db)
-                dpg.add_button(label=" Disconnect ", tag="btn_db_disconnect",
+                dpg.add_button(label=" Desconectar ", tag="btn_db_disconnect",
                                callback=self._cb_disconnect_db, enabled=False)
                 dpg.add_spacer(width=16)
                 dpg.add_button(
-                    label=" Close ",
+                    label=" Cerrar ",
                     callback=lambda: dpg.configure_item("win_db_config", show=False),
                 )
 
@@ -821,7 +866,7 @@ class GUIApp:
                 if cur == self._last_frame_no:
                     self._stall_tick += 1
                     if self._stall_tick >= STALL_FRAMES:
-                        logging.warning("Stream stalled for 30 s — disconnecting")
+                        logging.warning("Transmisión detenida por 30 s — desconectando")
                         asyncio.create_task(self._do_disconnect())
                         self._stall_tick = 0
                 else:
@@ -836,7 +881,7 @@ class GUIApp:
             await asyncio.sleep(FRAME_PERIOD)
 
         # ── Cleanup on window close ──────────────────────────────────────────
-        logging.info("Window closed — cleaning up")
+        logging.info("Ventana cerrada — limpiando")
         if self.client:
             await self.client.disconnect()
         dpg.destroy_context()
