@@ -49,7 +49,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgl1-mesa-glx libegl1-mesa libxrandr2 \
+          sudo apt-get install -y libgl1 libglx-mesa0 libegl1 libxrandr2 \
             libxss1 libxcursor1 libxcomposite1 libxi6 libxtst6 libx11-6
 
       - name: Build with PyInstaller (macOS)
