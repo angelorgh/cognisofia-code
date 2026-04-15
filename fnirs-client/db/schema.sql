@@ -211,7 +211,8 @@ CREATE TABLE IF NOT EXISTS frames (
     dark_d13  REAL,  dark_d14  REAL,  dark_d15  REAL,  dark_d16  REAL,
 
     -- ── Stimulus marker ───────────────────────────────────────────────────
-    stimulus  SMALLINT NOT NULL DEFAULT 0
+    stimulus             SMALLINT NOT NULL DEFAULT 0,
+    stimulus_annotation  TEXT     NOT NULL DEFAULT ''
 );
 
 -- Convert to TimescaleDB hypertable, partitioned by timestamp

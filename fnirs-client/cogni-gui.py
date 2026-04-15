@@ -11,12 +11,20 @@ Requires:
 import asyncio
 import json
 import logging
+import sys
 import time
 from collections import deque
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import dearpygui.dearpygui as dpg
+
+
+def _asset_path(relative: str) -> str:
+    """Resolve an asset path for both normal execution and PyInstaller bundle."""
+    if getattr(sys, '_MEIPASS', None):
+        return str(Path(sys._MEIPASS) / relative)
+    return str(Path(__file__).parent / relative)
 
 from NIRDuinoClient import (
     FNIRSClient,
@@ -369,6 +377,11 @@ class GUIApp:
         if self.client:
             new_state = not self.client.stimulus_active
             self.client.set_stimulus(new_state)
+            # Sync annotation text to client
+            self.client.stimulus_annotation = (
+                dpg.get_value("input_stimulus_annotation").strip()
+                if new_state else ""
+            )
             t_now = time.time() - self._plot_t0
             if new_state:
                 # Open a new interval
@@ -544,7 +557,7 @@ class GUIApp:
         dpg.create_context()
 
         with dpg.font_registry():
-            default_font = dpg.add_font("./fonts/JetBrainsMonoNL-Regular.ttf", 16)
+            default_font = dpg.add_font(_asset_path("fonts/JetBrainsMonoNL-Regular.ttf"), 16)
             
         dpg.create_viewport(
             title="NIRDuino fNIRS Cliente",
@@ -637,6 +650,10 @@ class GUIApp:
                                    callback=self._cb_stop)
                     dpg.add_button(label="Estímulo: OFF",         tag="btn_stimulus",
                                    callback=self._cb_stimulus)
+                    dpg.add_spacer(width=16)
+                    dpg.add_text("Anotación:")
+                    dpg.add_input_text(tag="input_stimulus_annotation", width=200,
+                                       hint="ej. Reposo, Tarea aritmética")
                 dpg.add_spacer(height=6)
                 with dpg.group(horizontal=True):
                     dpg.add_text("Tramas: 0",    tag="lbl_frames")

@@ -1,0 +1,97 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: NIRDuino-macOS
+            asset_name: NIRDuino-macOS.zip
+            build_cmd: |
+              cd fnirs-client
+              pyinstaller cogni-gui.spec
+              cd dist
+              zip -r9 ../../NIRDuino-macOS.zip NIRDuino.app
+
+          - os: windows-latest
+            artifact: NIRDuino-Windows
+            asset_name: NIRDuino-Windows.zip
+            build_cmd: |
+              cd fnirs-client
+              pyinstaller cogni-gui.spec
+              Compress-Archive -Path dist\NIRDuino.exe -DestinationPath ..\NIRDuino-Windows.zip
+
+          - os: ubuntu-latest
+            artifact: NIRDuino-Linux
+            asset_name: NIRDuino-Linux.tar.gz
+            build_cmd: |
+              cd fnirs-client
+              pyinstaller cogni-gui.spec
+              cd dist
+              tar czf ../../NIRDuino-Linux.tar.gz NIRDuino
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: fnirs-client/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r fnirs-client/requirements.txt
+          pip install pyinstaller
+
+      # Linux needs display server for DearPyGui build
+      - name: Install Linux display dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-glx libegl1-mesa libxrandr2 \
+            libxss1 libxcursor1 libxcomposite1 libxi6 libxtst6 libx11-6
+
+      - name: Build with PyInstaller
+        run: ${{ matrix.build_cmd }}
+        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.asset_name }}
+          retention-days: 5
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            NIRDuino-macOS.zip
+            NIRDuino-Windows.zip
+            NIRDuino-Linux.tar.gz

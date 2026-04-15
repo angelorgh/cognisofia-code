@@ -86,6 +86,7 @@ def _build_frames_insert_sql() -> str:
     for d in range(1, NUM_PHYSICAL_DETECTORS + 1):
         cols.append(f"dark_d{d}")
     cols.append("stimulus")
+    cols.append("stimulus_annotation")
     ph = ", ".join(["%s"] * len(cols))
     return f"INSERT INTO frames ({', '.join(cols)}) VALUES ({ph})"
 
@@ -138,6 +139,7 @@ class DBWriter:
             self.conn = None
             return False, str(exc)
 
+    @staticmethod
     def test_connection(self, host: str, port: str, dbname: str,
                         user: str, password: str) -> tuple:
         """Test credentials without storing a permanent connection."""
@@ -215,6 +217,7 @@ class DBWriter:
 
     def write_frame(self, ts: datetime, time_elapsed: float,
                     frame_data: List[List[int]], stimulus: int,
+                    stimulus_annotation: str,
                     led_config: Optional[dict]) -> bool:
         """Buffer one frame row.
 
@@ -225,7 +228,8 @@ class DBWriter:
         if not self.is_connected or self._session_id is None:
             return False
         row = self._build_row(
-            ts, self._session_id, time_elapsed, frame_data, stimulus, led_config
+            ts, self._session_id, time_elapsed, frame_data, stimulus,
+            stimulus_annotation, led_config
         )
         self._pending.append(row)
         return len(self._pending) >= self.BATCH_SIZE
@@ -271,6 +275,7 @@ class DBWriter:
     @staticmethod
     def _build_row(ts: datetime, session_id, time_elapsed: float,
                    frame_data: List[List[int]], stimulus: int,
+                   stimulus_annotation: str,
                    led_config: Optional[dict]) -> tuple:
         cfg = led_config or {}
         rp7 = cfg.get("rp_740", [0] * NUM_PHYSICAL_SOURCES)
@@ -300,6 +305,7 @@ class DBWriter:
             vals.append(_adc_to_voltage(frame_data[32][det]))
 
         vals.append(stimulus)
+        vals.append(stimulus_annotation)
         return tuple(vals)
 
 
@@ -341,6 +347,7 @@ class CSVWriter:
 
         # Stimulus marker
         header.append("Stimulus")
+        header.append("Stimulus_Annotation")
 
         return header
 
@@ -376,6 +383,7 @@ class CSVWriter:
         self,
         frame_data: List[List[int]],
         stimulus: int = 0,
+        stimulus_annotation: str = "",
         led_config: Optional[dict] = None,
     ):
         """
@@ -444,6 +452,7 @@ class CSVWriter:
 
         # Stimulus marker
         row.append(stimulus)
+        row.append(stimulus_annotation)
 
         # Write row
         self.csv_writer.writerow(row)
@@ -484,6 +493,7 @@ class FNIRSClient:
 
         # Stimulus state (can be toggled by user)
         self.stimulus_active = False
+        self.stimulus_annotation: str = ""
 
         # Battery level
         self.battery_level: Optional[int] = None
@@ -618,13 +628,14 @@ class FNIRSClient:
         # Write to active output(s)
         if self.recording:
             stimulus = 1 if self.stimulus_active else 0
+            annotation = self.stimulus_annotation
             elapsed = (time.time() - self._session_start_time
                        if self._session_start_time else 0.0)
             if self.output_mode in ("csv", "both"):
-                self.csv_writer.write_frame(data, stimulus, self.led_config)
+                self.csv_writer.write_frame(data, stimulus, annotation, self.led_config)
             if self.output_mode in ("db", "both") and self.db_writer:
                 batch_ready = self.db_writer.write_frame(
-                    datetime.now(), elapsed, data, stimulus, self.led_config
+                    datetime.now(), elapsed, data, stimulus, annotation, self.led_config
                 )
                 if batch_ready:
                     # Atomically take the full batch and flush it in a
