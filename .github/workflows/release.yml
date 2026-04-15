@@ -15,15 +15,15 @@ jobs:
         include:
           - os: macos-latest
             artifact: NIRDuino-macOS
-            asset_name: NIRDuino-macOS.zip
+            asset_name: NIRDuino-${{ github.ref_name }}-macOS.zip
 
           - os: windows-latest
             artifact: NIRDuino-Windows
-            asset_name: NIRDuino-Windows.zip
+            asset_name: NIRDuino-${{ github.ref_name }}-Windows.zip
 
           - os: ubuntu-latest
             artifact: NIRDuino-Linux
-            asset_name: NIRDuino-Linux.tar.gz
+            asset_name: NIRDuino-${{ github.ref_name }}-Linux.tar.gz
 
     runs-on: ${{ matrix.os }}
 
@@ -59,7 +59,7 @@ jobs:
           cd fnirs-client
           pyinstaller cogni-gui.spec
           cd dist
-          zip -r9 ../../NIRDuino-macOS.zip NIRDuino.app
+          zip -r9 ../../NIRDuino-${{ github.ref_name }}-macOS.zip NIRDuino.app
 
       - name: Build with PyInstaller (Windows)
         if: matrix.os == 'windows-latest'
@@ -67,7 +67,7 @@ jobs:
         run: |
           cd fnirs-client
           pyinstaller cogni-gui.spec
-          Compress-Archive -Path dist\NIRDuino.exe -DestinationPath ..\NIRDuino-Windows.zip
+          Compress-Archive -Path dist\NIRDuino.exe -DestinationPath ..\NIRDuino-${{ github.ref_name }}-Windows.zip
 
       - name: Build with PyInstaller (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -76,7 +76,7 @@ jobs:
           cd fnirs-client
           pyinstaller cogni-gui.spec
           cd dist
-          tar czf ../../NIRDuino-Linux.tar.gz NIRDuino
+          tar czf ../../NIRDuino-${{ github.ref_name }}-Linux.tar.gz NIRDuino
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -100,6 +100,6 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            NIRDuino-macOS.zip
-            NIRDuino-Windows.zip
-            NIRDuino-Linux.tar.gz
+            NIRDuino-${{ github.ref_name }}-macOS.zip
+            NIRDuino-${{ github.ref_name }}-Windows.zip
+            NIRDuino-${{ github.ref_name }}-Linux.tar.gz
