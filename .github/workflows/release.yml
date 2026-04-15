@@ -16,6 +16,7 @@ jobs:
           - os: macos-latest
             artifact: NIRDuino-macOS
             asset_name: NIRDuino-macOS.zip
+            shell: bash
             build_cmd: |
               cd fnirs-client
               pyinstaller cogni-gui.spec
@@ -25,6 +26,7 @@ jobs:
           - os: windows-latest
             artifact: NIRDuino-Windows
             asset_name: NIRDuino-Windows.zip
+            shell: pwsh
             build_cmd: |
               cd fnirs-client
               pyinstaller cogni-gui.spec
@@ -33,6 +35,7 @@ jobs:
           - os: ubuntu-latest
             artifact: NIRDuino-Linux
             asset_name: NIRDuino-Linux.tar.gz
+            shell: bash
             build_cmd: |
               cd fnirs-client
               pyinstaller cogni-gui.spec
@@ -68,7 +71,7 @@ jobs:
 
       - name: Build with PyInstaller
         run: ${{ matrix.build_cmd }}
-        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
+        shell: ${{ matrix.shell }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
