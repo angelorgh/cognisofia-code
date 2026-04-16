@@ -108,6 +108,7 @@ def _adc_to_v(raw: int) -> float:
 # Persistent config  (~/.cogni/config.json)
 # ─────────────────────────────────────────────────────────────────────────────
 _CONFIG_PATH = Path.home() / ".cogni" / "config.json"
+DEFAULT_CSV_OUTPUT_DIR = str(Path.home() / ".cogni" / "data")
 
 
 def _load_config() -> dict:
@@ -175,6 +176,9 @@ class GUIApp:
 
         # TimescaleDB writer — shared across streaming sessions
         self.db_writer = DBWriter()
+
+        # CSV output directory (persisted in ~/.cogni/config.json)
+        self.csv_output_dir: str = DEFAULT_CSV_OUTPUT_DIR
 
         # Map radio-button label → FNIRSClient output_mode string
         self._output_mode_map = {
@@ -298,7 +302,7 @@ class GUIApp:
         self._set_status("Conectando...", (255, 200, 0))
         self._refresh_buttons()
 
-        self.client = FNIRSClient(output_dir="data")
+        self.client = FNIRSClient(output_dir=self.csv_output_dir)
         self.client.on_frame_received = self._on_frame
 
         ok = await self.client.connect(self.device)
@@ -341,7 +345,7 @@ class GUIApp:
         # Validate DB connection when it's required
         if output_mode in ("db", "both") and not self.db_writer.is_connected:
             self._set_status(
-                "Base de datos no conectada — abrir Conexiones → Base de datos",
+                "Base de datos no conectada — abrir Configuración",
                 (255, 80, 80),
             )
             self._refresh_buttons()
@@ -458,9 +462,48 @@ class GUIApp:
         await self.client.client.write_gatt_char(LED_CHAR_UUID, packet)
         logging.info("Intensidades de LED actualizadas")
 
-    # ── Database connection callbacks ─────────────────────────────────────────
-    def _cb_open_db_window(self, *_):
-        dpg.configure_item("win_db_config", show=True)
+    # ── Configuration window callbacks ────────────────────────────────────────
+    def _cb_open_config_window(self, *_):
+        dpg.configure_item("win_config", show=True)
+
+    def _cb_pick_csv_dir(self, *_):
+        # Point the dialog at the currently configured directory so the user
+        # starts browsing from a sensible location.
+        try:
+            dpg.configure_item(
+                "file_dialog_csv_dir", default_path=self.csv_output_dir
+            )
+        except Exception:
+            pass
+        dpg.show_item("file_dialog_csv_dir")
+
+    def _cb_csv_dir_selected(self, sender, app_data):
+        path = app_data.get("file_path_name") or app_data.get("current_path")
+        if not path:
+            return
+        self.csv_output_dir = path
+        dpg.set_value("csv_dir_display", path)
+        self._save_csv_output_dir()
+        # If the client already exists, retarget its CSV writer so the next
+        # session writes to the new directory without requiring a reconnect.
+        if self.client and self.client.csv_writer:
+            self.client.csv_writer.output_dir = Path(path)
+            self.client.csv_writer.output_dir.mkdir(parents=True, exist_ok=True)
+        logging.info("Directorio de salida CSV: %s", path)
+
+    def _load_csv_output_dir(self):
+        """Load the CSV output directory from config (or use the default)."""
+        cfg = _load_config()
+        saved = cfg.get("csv_output_dir")
+        if saved:
+            self.csv_output_dir = saved
+        dpg.set_value("csv_dir_display", self.csv_output_dir)
+
+    def _save_csv_output_dir(self):
+        """Persist the current CSV output directory to ~/.cogni/config.json."""
+        cfg = _load_config()
+        cfg["csv_output_dir"] = self.csv_output_dir
+        _save_config(cfg)
 
     def _cb_test_db(self, *_):
         self._pending.append(self._do_test_db)
@@ -586,11 +629,10 @@ class GUIApp:
 
             # ── Menu bar ─────────────────────────────────────────────────────
             with dpg.menu_bar():
-                with dpg.menu(label="Conexiones"):
-                    dpg.add_menu_item(
-                        label="Base de datos",
-                        callback=self._cb_open_db_window,
-                    )
+                dpg.add_menu_item(
+                    label="Configuración",
+                    callback=self._cb_open_config_window,
+                )
 
             dpg.add_text("NIRDuino fNIRS Cliente", color=(0, 210, 255))
             dpg.add_separator()
@@ -785,17 +827,31 @@ class GUIApp:
         #dpg.show_font_manager()
         dpg.maximize_viewport()
 
-        # ── Database connections window (top-level, toggled by menu) ──────────
-        with dpg.window(
-            label="Conexión a la base de datos",
-            tag="win_db_config",
+        # ── File dialog for CSV output directory ──────────────────────────────
+        with dpg.file_dialog(
+            directory_selector=True,
             show=False,
-            width=500,
-            height=270,
+            modal=True,
+            tag="file_dialog_csv_dir",
+            callback=self._cb_csv_dir_selected,
+            width=700,
+            height=400,
+            default_path=self.csv_output_dir,
+        ):
+            pass
+
+        # ── Unified configuration window (top-level, toggled by menu) ─────────
+        with dpg.window(
+            label="Configuración",
+            tag="win_config",
+            show=False,
+            width=560,
+            height=480,
             no_collapse=True,
             pos=[120, 80],
         ):
-            dpg.add_text("Configuración de conexión TimescaleDB", color=(160, 160, 160))
+            # ── Section: Base de datos ────────────────────────────────────────
+            dpg.add_text("Base de datos", color=(0, 210, 255))
             dpg.add_separator()
             dpg.add_spacer(height=6)
 
@@ -821,10 +877,10 @@ class GUIApp:
                 dpg.add_text("Contraseña:")
                 dpg.add_input_text(tag="db_pass", password=True, width=200)
 
-            dpg.add_spacer(height=10)
+            dpg.add_spacer(height=8)
             dpg.add_text("● Sin conexión", tag="db_conn_status",
                          color=(180, 180, 180))
-            dpg.add_spacer(height=10)
+            dpg.add_spacer(height=6)
 
             with dpg.group(horizontal=True):
                 dpg.add_button(label=" Probar ",
@@ -833,18 +889,38 @@ class GUIApp:
                                callback=self._cb_connect_db)
                 dpg.add_button(label=" Desconectar ", tag="btn_db_disconnect",
                                callback=self._cb_disconnect_db, enabled=False)
-                dpg.add_spacer(width=16)
-                dpg.add_button(
-                    label=" Cerrar ",
-                    callback=lambda: dpg.configure_item("win_db_config", show=False),
-                )
+
+            dpg.add_spacer(height=18)
+
+            # ── Section: Directorio output CSV ────────────────────────────────
+            dpg.add_text("Directorio output CSV", color=(0, 210, 255))
+            dpg.add_separator()
+            dpg.add_spacer(height=6)
+
+            dpg.add_text("Ruta actual:", color=(160, 160, 160))
+            dpg.add_text(self.csv_output_dir, tag="csv_dir_display",
+                         color=(220, 220, 220), wrap=520)
+            dpg.add_spacer(height=6)
+            dpg.add_button(label=" Seleccionar directorio... ",
+                           callback=self._cb_pick_csv_dir)
+
+            dpg.add_spacer(height=18)
+            dpg.add_separator()
+            dpg.add_spacer(height=6)
+
+            # ── Close button ──────────────────────────────────────────────────
+            dpg.add_button(
+                label=" Cerrar ",
+                callback=lambda: dpg.configure_item("win_config", show=False),
+            )
 
         dpg.set_primary_window("main_window", True)
         dpg.show_viewport()
         self._refresh_buttons()
 
-        # Pre-fill DB fields from persisted config (must run after all widgets exist).
-        # If credentials are present, queue an auto-connect on the first loop tick.
+        # Pre-fill fields from persisted config (must run after all widgets exist).
+        self._load_csv_output_dir()
+        # If DB credentials are present, queue an auto-connect on the first loop tick.
         if self._load_db_config():
             self._pending.append(self._do_connect_db)
 
