@@ -865,7 +865,7 @@ class GUIApp:
             dpg.add_spacer(height=4)
             with dpg.group(horizontal=True):
                 dpg.add_text("Base de datos:")
-                dpg.add_input_text(tag="db_name", default_value="fnirs_db", width=200)
+                dpg.add_input_text(tag="db_name", default_value="fnirs_data", width=200)
 
             dpg.add_spacer(height=4)
             with dpg.group(horizontal=True):
